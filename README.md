@@ -10,7 +10,7 @@ Os dois tons foram extraídos de conversas reais de um grupo de WhatsApp da comu
 ## Stack
 
 - **Next.js 14** (App Router) — UI de chatbot + função serverless.
-- **Groq API** com **Llama 3.3 70B** — LLM **gratuito** e ótimo em PT-BR.
+- **Groq API** com **Llama 3.1 8B Instant** — LLM **gratuito**, rápido e com limite diário alto (500k tokens/dia). Troque via `GROQ_MODEL`.
 - Deploy **serverless** na **Vercel** com 1 clique.
 
 ## Rodando localmente
@@ -45,6 +45,12 @@ GROQ_API_KEY_5=gsk_...
 A cada requisição o app **sorteia uma chave aleatoriamente** e, se ela estiver
 no limite (`429`) ou der erro transitório, **cai automaticamente pra próxima**.
 Chaves não configuradas são simplesmente ignoradas.
+
+> ⚠️ **Importante:** os limites da Groq são **por organização (conta)**, não por
+> chave. Várias chaves da MESMA conta compartilham o mesmo limite diário — a
+> rotação só multiplica a capacidade se as chaves forem de **contas diferentes**.
+> Pra um projeto de zoeira, o limite diário do `llama-3.1-8b-instant` (500k
+> tokens/dia) já costuma sobrar.
 
 ## Deploy na Vercel
 

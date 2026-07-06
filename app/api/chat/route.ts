@@ -9,8 +9,12 @@ interface ChatMessage {
 }
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-// Llama 3.3 70B: ótimo em PT-BR e gratuito no free tier da Groq.
-const MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// Llama 3.1 8B Instant: free tier com limite diário bem maior (500k tokens/dia
+// vs 100k do 70B) e mais rápido. Suficiente pra esse chatbot de zoeira em PT-BR.
+// OBS: os limites da Groq são POR ORGANIZAÇÃO, não por chave — várias chaves da
+// mesma conta compartilham o mesmo limite diário. Pra escalar de verdade, use
+// chaves de contas diferentes ou faça upgrade (GROQ_MODEL troca o modelo).
+const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 
 // Pool de chaves da Groq. No Edge runtime as envs precisam ser referenciadas
 // por nome (não dá pra enumerar process.env), então listamos explicitamente.
@@ -114,7 +118,7 @@ export async function POST(req: Request) {
 
   const history = (body.messages || [])
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && m.content)
-    .slice(-12);
+    .slice(-8); // menos histórico = menos tokens = mais fôlego no limite diário
 
   const system = `${persona.systemPrompt}
 
@@ -131,7 +135,7 @@ Exemplo: {"reply": "sua resposta em personagem, em português, curta", "delta": 
     model: MODEL,
     messages,
     temperature: 0.9,
-    max_tokens: 320,
+    max_tokens: 200,
     top_p: 0.95,
     response_format: { type: "json_object" },
   });
@@ -178,6 +182,17 @@ Exemplo: {"reply": "sua resposta em personagem, em português, curta", "delta": 
     }
 
     if (!result) {
+      // Limite diário/burst da IA estourado -> mensagem amigável em vez de erro cru.
+      if (lastStatus === 429) {
+        const m = lastDetail.match(/try again in ([\dhms.]+)/i);
+        const when = m ? ` Tenta de novo em ${m[1]}.` : " Tenta de novo daqui a pouco.";
+        return Response.json(
+          {
+            error: `Opa, muita gente discutindo ao mesmo tempo e a IA gratuita bateu o limite do dia 🥵.${when}`,
+          },
+          { status: 429 }
+        );
+      }
       return Response.json(
         { error: `Erro da API Groq (${lastStatus})`, detail: lastDetail },
         { status: 502 }
