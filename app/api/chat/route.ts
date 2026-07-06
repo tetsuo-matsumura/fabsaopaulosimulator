@@ -42,6 +42,49 @@ function clampMeter(n: unknown): number {
   return Math.max(0, Math.min(100, Math.round(v)));
 }
 
+// LLM às vezes escreve JSON "quase válido" (ex.: "delta": +18, que o JSON não
+// aceita). Sanitiza e tenta extrair { reply, delta } de forma tolerante.
+function sanitizeJsonish(s: string): string {
+  return s.replace(/([:,[]\s*)\+(\d)/g, "$1$2"); // remove o + antes de números
+}
+
+function parseReplyDelta(raw: string): { reply: string; delta: number } | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  const candidates = [trimmed];
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start !== -1 && end > start) candidates.push(trimmed.slice(start, end + 1));
+
+  for (const c of candidates) {
+    try {
+      const parsed = JSON.parse(sanitizeJsonish(c));
+      const reply = String(parsed.reply ?? "").trim();
+      const d = Number(parsed.delta);
+      const delta = Number.isFinite(d)
+        ? Math.max(-15, Math.min(25, Math.round(d)))
+        : 0;
+      if (reply) return { reply, delta };
+    } catch {
+      // tenta o próximo candidato
+    }
+  }
+  return null;
+}
+
+// Quando a Groq rejeita o JSON (400 json_validate_failed), o texto gerado vem
+// em error.failed_generation — dá pra salvar em vez de perder a resposta.
+function salvageFromError(detail: string): { reply: string; delta: number } | null {
+  try {
+    const parsed = JSON.parse(detail);
+    const failed = parsed?.error?.failed_generation;
+    if (typeof failed === "string") return parseReplyDelta(failed);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export async function POST(req: Request) {
   const keyPool = getKeyPool();
   if (keyPool.length === 0) {
@@ -79,8 +122,9 @@ ${persona.gameInstruction}
 
 SEU MEDIDOR ATUAL: ${meter}/100. Quanto mais alto, mais intenso fica seu tom (mais próximo do limite).
 
-FORMATO DE SAÍDA — responda SOMENTE com um JSON válido, sem texto fora dele:
-{"reply": "sua resposta em personagem, em português, curta", "delta": <inteiro entre -15 e 25 = quanto a ÚLTIMA mensagem da pessoa move o seu medidor>}`;
+FORMATO DE SAÍDA — responda SOMENTE com um JSON válido, sem texto fora dele.
+"delta" é um inteiro entre -15 e 25 (quanto a ÚLTIMA mensagem da pessoa move o seu medidor). Escreva o número sem sinal de mais na frente (ex.: 18, 0, -5 — NUNCA +18).
+Exemplo: {"reply": "sua resposta em personagem, em português, curta", "delta": 12}`;
 
   const messages = [{ role: "system", content: system }, ...history];
   const payload = JSON.stringify({
@@ -93,7 +137,7 @@ FORMATO DE SAÍDA — responda SOMENTE com um JSON válido, sem texto fora dele:
   });
 
   try {
-    let resp: Response | null = null;
+    let result: { reply: string; delta: number } | null = null;
     let lastStatus = 0;
     let lastDetail = "";
 
@@ -110,43 +154,39 @@ FORMATO DE SAÍDA — responda SOMENTE com um JSON válido, sem texto fora dele:
       });
 
       if (r.ok) {
-        resp = r;
+        const data = await r.json();
+        const raw: string = data?.choices?.[0]?.message?.content?.trim() || "";
+        result = parseReplyDelta(raw) || { reply: raw, delta: 0 };
         break;
       }
 
       lastStatus = r.status;
       lastDetail = await r.text();
-      // 429 = rate limit, 5xx = erro transitório -> vale tentar outra chave.
-      // Outros erros (ex.: 400) são do request, não adianta trocar chave.
+
+      // 400 json_validate_failed: o modelo gerou JSON quase válido -> salva.
+      if (r.status === 400) {
+        const salvaged = salvageFromError(lastDetail);
+        if (salvaged) {
+          result = salvaged;
+          break;
+        }
+      }
+
+      // 429 = rate limit, 5xx = erro transitório -> tenta a próxima chave.
+      // Outros erros do request não melhoram trocando de chave.
       if (r.status !== 429 && r.status < 500) break;
     }
 
-    if (!resp) {
+    if (!result) {
       return Response.json(
         { error: `Erro da API Groq (${lastStatus})`, detail: lastDetail },
         { status: 502 }
       );
     }
 
-    const data = await resp.json();
-    const raw: string = data?.choices?.[0]?.message?.content?.trim() || "";
-
-    let reply = "";
-    let delta = 0;
-    try {
-      const parsed = JSON.parse(raw);
-      reply = String(parsed.reply || "").trim();
-      const d = Number(parsed.delta);
-      delta = Number.isFinite(d) ? Math.max(-15, Math.min(25, Math.round(d))) : 0;
-    } catch {
-      // se o modelo fugir do JSON, usa o texto cru como resposta
-      reply = raw;
-      delta = 0;
-    }
-
-    if (!reply) reply = `(o ${persona.firstName} ficou sem palavras...)`;
-
-    return Response.json({ reply, delta });
+    const reply =
+      result.reply.trim() || `(o ${persona.firstName} ficou sem palavras...)`;
+    return Response.json({ reply, delta: result.delta });
   } catch (err) {
     return Response.json(
       { error: "Falha ao chamar a IA.", detail: String(err) },
